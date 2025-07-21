@@ -553,3 +553,141 @@
     )
   )
 )
+
+;; PUBLIC FUNCTIONS - LIQUIDATION SYSTEM
+
+;; Execute liquidation of undercollateralized positions
+(define-public (liquidate-loan
+    (loan-id uint)
+    (borrowed-token <token-trait>)
+    (collateral-token <token-trait>)
+  )
+  (let*
+    (
+      (loan (get-loan loan-id))
+      (liquidatable (is-loan-liquidatable loan-id))
+      (collateral-asset-info (get-asset-info (get collateral-asset loan)))
+      (borrowed-asset-info (get-asset-info (get borrowed-asset loan)))
+      (current-height block-height)
+      (blocks-elapsed (- current-height (get last-update-height loan)))
+      (accrued-amount (calculate-accrued-amount (get borrowed-amount loan) (get interest-rate loan)
+      blocks-elapsed
+    ))
+      (penalty-amount (/ (* accrued-amount LIQUIDATION_PENALTY) u100))
+      (total-repay-amount (+ accrued-amount penalty-amount))
+      (fee-amount (/ (* accrued-amount PROTOCOL_FEE) u1000))
+    )
+    ;; Liquidation eligibility validation
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active loan) ERR_LOAN_NOT_FOUND)
+    (asserts! liquidatable ERR_LOAN_NOT_LIQUIDATABLE)
+    ;; Execute liquidation payment from liquidator
+    (match (contract-call? borrowed-token transfer (get borrowed-asset loan)
+      total-repay-amount tx-sender (as-contract tx-sender)
+    )
+      success (begin
+        ;; Protocol fee collection from liquidation
+        (var-set total-protocol-fees (+ (var-get total-protocol-fees) fee-amount))
+        ;; Close liquidated loan position
+        (map-set loans { loan-id: loan-id }
+          (merge loan {
+            borrowed-amount: u0,
+            last-update-height: current-height,
+            active: false,
+          })
+        )
+        ;; Update global borrowing metrics
+        (map-set supported-assets { asset-id: (get borrowed-asset loan) }
+          (merge borrowed-asset-info { total-borrowed: (- (get total-borrowed borrowed-asset-info) (get borrowed-amount loan)) })
+        )
+        ;; Transfer collateral reward to liquidator
+        (as-contract (contract-call? collateral-token transfer (get collateral-asset loan)
+          (get collateral-amount loan) (as-contract tx-sender) tx-sender
+        ))
+        (ok true)
+      )
+      error (err error)
+    ))
+)
+
+;; ADMINISTRATIVE FUNCTIONS - PROTOCOL MANAGEMENT
+
+;; Register new asset with oracle integration
+(define-public (add-supported-asset
+    (asset-id (string-ascii 42))
+    (oracle-principal principal)
+    (oracle-function (string-ascii 40))
+    (decimals uint)
+  )
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (map-set supported-assets { asset-id: asset-id } {
+      oracle-principal: oracle-principal,
+      oracle-function: oracle-function,
+      decimals: decimals,
+      active: true,
+      total-supplied: u0,
+      total-borrowed: u0,
+    })
+    (ok true)
+  )
+)
+
+;; Toggle asset availability in the protocol
+(define-public (set-asset-active
+    (asset-id (string-ascii 42))
+    (active bool)
+  )
+  (let ((asset-info (get-asset-info asset-id)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+      (map-set supported-assets { asset-id: asset-id }
+        (merge asset-info { active: active })
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Transfer protocol ownership
+(define-public (set-protocol-owner (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (var-set protocol-owner new-owner)
+    (ok true)
+  )
+)
+
+;; Emergency protocol pause mechanism
+(define-public (set-protocol-paused (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (var-set protocol-paused paused)
+    (ok true)
+  )
+)
+
+;; Configure default oracle for price feeds
+(define-public (set-default-oracle (oracle-principal principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (var-set default-oracle-principal oracle-principal)
+    (ok true)
+  )
+)
+
+;; Withdraw accumulated protocol fees
+(define-public (withdraw-protocol-fees
+    (asset-id (string-ascii 42))
+    (amount uint)
+    (token-contract <token-trait>)
+  )
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (asserts! (<= amount (var-get total-protocol-fees)) ERR_INVALID_AMOUNT)
+    (var-set total-protocol-fees (- (var-get total-protocol-fees) amount))
+    (as-contract (contract-call? token-contract transfer asset-id amount
+      (as-contract tx-sender) (var-get protocol-owner)
+    ))
+  )
+)
