@@ -107,3 +107,106 @@
   }
   { amount: uint }
 )
+
+;; Active lending positions with full loan lifecycle tracking
+(define-map loans
+  { loan-id: uint }
+  {
+    borrower: principal,
+    collateral-asset: (string-ascii 42),
+    collateral-amount: uint,
+    borrowed-asset: (string-ascii 42),
+    borrowed-amount: uint,
+    creation-height: uint,
+    last-update-height: uint,
+    interest-rate: uint,
+    active: bool,
+  }
+)
+
+;; User loan portfolio tracking
+(define-map user-loans
+  { user: principal }
+  { loan-ids: (list 20 uint) }
+)
+
+;; READ-ONLY FUNCTIONS - PROTOCOL INFORMATION
+
+;; Comprehensive protocol status and metrics
+(define-read-only (get-protocol-info)
+  (let (
+      (paused (var-get protocol-paused))
+      (owner (var-get protocol-owner))
+      (loan-count (- (var-get next-loan-id) u1))
+      (fees (var-get total-protocol-fees))
+    )
+    {
+      paused: paused,
+      owner: owner,
+      loan-count: loan-count,
+      accumulated-fees: fees,
+    }
+  )
+)
+
+;; Asset configuration and market statistics
+(define-read-only (get-asset-info (asset-id (string-ascii 42)))
+  (default-to {
+    oracle-principal: (var-get default-oracle-principal),
+    oracle-function: "get-price",
+    decimals: u0,
+    active: false,
+    total-supplied: u0,
+    total-borrowed: u0,
+  }
+    (map-get? supported-assets { asset-id: asset-id })
+  )
+)
+
+;; Real-time asset pricing from oracle feeds
+(define-read-only (get-asset-price (asset-id (string-ascii 42)))
+  (let ((asset-info (get-asset-info asset-id)))
+    (if (get active asset-info)
+      (contract-call?
+        (unwrap-panic (contract-of (get oracle-principal asset-info)))
+        get-price asset-id
+      )
+      (err ERR_ASSET_NOT_SUPPORTED)
+    )
+  )
+)
+
+;; User lending position balance
+(define-read-only (get-user-supply
+    (user principal)
+    (asset-id (string-ascii 42))
+  )
+  (default-to { amount: u0 }
+    (map-get? user-supplies {
+      user: user,
+      asset-id: asset-id,
+    })
+  )
+)
+
+;; User loan portfolio overview
+(define-read-only (get-user-loan-ids (user principal))
+  (default-to { loan-ids: (list) } (map-get? user-loans { user: user }))
+)
+
+;; Detailed loan information and status
+(define-read-only (get-loan (loan-id uint))
+  (default-to {
+    borrower: 'ST000000000000000000002AMW42H,
+    collateral-asset: "",
+    collateral-amount: u0,
+    borrowed-asset: "",
+    borrowed-amount: u0,
+    creation-height: u0,
+    last-update-height: u0,
+    interest-rate: u0,
+    active: false,
+  }
+    (map-get? loans { loan-id: loan-id })
+  )
+)
