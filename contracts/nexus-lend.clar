@@ -354,3 +354,93 @@
     (as-contract (contract-call? token-contract transfer asset-id amount tx-sender tx-sender))
   )
 )
+
+;; PUBLIC FUNCTIONS - BORROWING OPERATIONS
+
+;; Create collateralized loan with automated risk assessment
+(define-public (create-loan
+    (collateral-asset (string-ascii 42))
+    (collateral-amount uint)
+    (borrowed-asset (string-ascii 42))
+    (borrow-amount uint)
+    (collateral-token <token-trait>)
+    (borrowed-token <token-trait>)
+  )
+  (let (
+      (collateral-info (get-asset-info collateral-asset))
+      (borrowed-info (get-asset-info borrowed-asset))
+      (loan-id (var-get next-loan-id))
+      (block-height block-height)
+      ;; Dynamic interest rates based on market conditions (simplified to 5% APY)
+      (interest-rate u500)
+    )
+    ;; Comprehensive validation suite
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active collateral-info) ERR_ASSET_NOT_SUPPORTED)
+    (asserts! (get active borrowed-info) ERR_ASSET_NOT_SUPPORTED)
+    (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> borrow-amount u0) ERR_INVALID_AMOUNT)
+    (asserts!
+      (>=
+        (- (get total-supplied borrowed-info) (get total-borrowed borrowed-info))
+        borrow-amount
+      )
+      ERR_INSUFFICIENT_LIQUIDITY
+    )
+    ;; Secure collateral transfer to protocol vault
+    (match (contract-call? collateral-token transfer collateral-asset collateral-amount
+      tx-sender (as-contract tx-sender)
+    )
+      success (begin
+        ;; Initialize loan record with full lifecycle tracking
+        (map-set loans { loan-id: loan-id } {
+          borrower: tx-sender,
+          collateral-asset: collateral-asset,
+          collateral-amount: collateral-amount,
+          borrowed-asset: borrowed-asset,
+          borrowed-amount: borrow-amount,
+          creation-height: block-height,
+          last-update-height: block-height,
+          interest-rate: interest-rate,
+          active: true,
+        })
+        ;; Update user's loan portfolio
+        (let ((user-loan-list (get loan-ids
+            (default-to { loan-ids: (list) }
+              (map-get? user-loans { user: tx-sender })
+            ))))
+          (map-set user-loans { user: tx-sender } { loan-ids: (append user-loan-list loan-id) })
+        )
+        ;; Update global borrowing metrics
+        (map-set supported-assets { asset-id: borrowed-asset }
+          (merge borrowed-info { total-borrowed: (+ (get total-borrowed borrowed-info) borrow-amount) })
+        )
+        ;; Increment loan counter for next loan
+        (var-set next-loan-id (+ loan-id u1))
+        ;; Risk assessment and loan approval
+        (let ((ratio-response (calculate-collateral-ratio loan-id)))
+          (if (is-ok ratio-response)
+            (let ((ratio (unwrap-panic ratio-response)))
+              (if (>= ratio MIN_COLLATERAL_RATIO)
+                ;; Execute loan disbursement
+                (as-contract (contract-call? borrowed-token transfer borrowed-asset
+                  borrow-amount tx-sender tx-sender
+                ))
+                ;; Loan rejection due to insufficient collateral
+                (begin
+                  (map-delete loans { loan-id: loan-id })
+                  (as-contract (contract-call? collateral-token transfer collateral-asset
+                    collateral-amount tx-sender tx-sender
+                  ))
+                  ERR_BELOW_MIN_COLLATERAL_RATIO
+                )
+              )
+            )
+            ERR_ASSET_NOT_SUPPORTED
+          )
+        )
+      )
+      error (err error)
+    )
+  )
+)
