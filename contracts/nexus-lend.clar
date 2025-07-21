@@ -444,3 +444,112 @@
     )
   )
 )
+
+;; Process loan repayment with interest calculation
+(define-public (repay-loan
+    (loan-id uint)
+    (repay-amount uint)
+    (borrowed-token <token-trait>)
+  )
+  (let*
+    (
+      (loan (get-loan loan-id))
+      (borrowed-info (get-asset-info (get borrowed-asset loan)))
+      (current-height block-height)
+      (blocks-elapsed (- current-height (get last-update-height loan)))
+      (accrued-amount (calculate-accrued-amount (get borrowed-amount loan) (get interest-rate loan)
+      blocks-elapsed
+    ))
+      (actual-repay-amount (if (> repay-amount accrued-amount)
+      accrued-amount
+      repay-amount
+    ))
+      (fee-amount (/ (* actual-repay-amount PROTOCOL_FEE) u1000))
+    )
+    ;; Loan validation and authorization
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active loan) ERR_LOAN_NOT_FOUND)
+    (asserts! (> repay-amount u0) ERR_INVALID_AMOUNT)
+    ;; Execute repayment transfer
+    (match (contract-call? borrowed-token transfer (get borrowed-asset loan)
+      actual-repay-amount tx-sender (as-contract tx-sender)
+    )
+      success (begin
+        (let ((remaining-borrowed (- accrued-amount actual-repay-amount)))
+          ;; Protocol fee collection
+          (var-set total-protocol-fees
+            (+ (var-get total-protocol-fees) fee-amount)
+          )
+          ;; Full loan closure and collateral release
+          (if (<= remaining-borrowed u0)
+            (begin
+              (map-set loans { loan-id: loan-id }
+                (merge loan {
+                  borrowed-amount: u0,
+                  last-update-height: current-height,
+                  active: false,
+                })
+              )
+              ;; Update global borrowing metrics
+              (map-set supported-assets { asset-id: (get borrowed-asset loan) }
+                (merge borrowed-info { total-borrowed: (- (get total-borrowed borrowed-info) (get borrowed-amount loan)) })
+              )
+              ;; Release collateral to borrower
+              (as-contract (contract-call? borrowed-token transfer (get collateral-asset loan)
+                (get collateral-amount loan) (as-contract tx-sender)
+                (get borrower loan)
+              ))
+            )
+            ;; Partial repayment processing
+            (begin
+              (map-set loans { loan-id: loan-id }
+                (merge loan {
+                  borrowed-amount: remaining-borrowed,
+                  last-update-height: current-height,
+                })
+              )
+              ;; Update global metrics for partial repayment
+              (map-set supported-assets { asset-id: (get borrowed-asset loan) }
+                (merge borrowed-info { total-borrowed: (+
+                  (- (get total-borrowed borrowed-info)
+                    (get borrowed-amount loan)
+                  )
+                  remaining-borrowed
+                ) }
+                ))
+            )
+          )
+          (ok true)
+        )
+      )
+      error (err error)
+    ))
+)
+
+;; Enhance loan collateral position
+(define-public (add-collateral
+    (loan-id uint)
+    (additional-amount uint)
+    (collateral-token <token-trait>)
+  )
+  (let ((loan (get-loan loan-id)))
+    ;; Authorization and validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active loan) ERR_LOAN_NOT_FOUND)
+    (asserts! (is-eq (get borrower loan) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> additional-amount u0) ERR_INVALID_AMOUNT)
+    ;; Execute collateral enhancement
+    (match (contract-call? collateral-token transfer (get collateral-asset loan)
+      additional-amount tx-sender (as-contract tx-sender)
+    )
+      success (begin
+        ;; Update loan collateral position
+        (map-set loans { loan-id: loan-id }
+          (merge loan { collateral-amount: (+ (get collateral-amount loan) additional-amount) })
+        )
+        (ok true)
+      )
+      error (err error)
+    )
+  )
+)
